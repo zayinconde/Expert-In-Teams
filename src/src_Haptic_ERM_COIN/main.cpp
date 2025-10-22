@@ -1,13 +1,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-// ---------- Pins ----------
-#define PIN_IRQ             27      // DA7280 nIRQ -> ESP32 GPIO (active LOW)
-
-// ---------- DA7280 I2C + Registers ----------
-#define DA7280_ADDR_PRIMARY 0x4A    // AD0 = VDD
-#define DA7280_ADDR_ALT     0x4B    // AD0 = GND
-uint8_t DA7280_ADDR = DA7280_ADDR_PRIMARY; // Will be auto-detected
+#define PIN_IRQ             27
+#define DA7280_ADDR_PRIMARY 0x4A
+#define DA7280_ADDR_ALT     0x4B
+uint8_t DA7280_ADDR = DA7280_ADDR_PRIMARY;
 
 #define REG_CHIP_REV        0x00
 #define REG_INT_MASK        0x09
@@ -17,14 +14,10 @@ uint8_t DA7280_ADDR = DA7280_ADDR_PRIMARY; // Will be auto-detected
 #define REG_TOP_CTL1        0x22
 #define REG_ACTUATOR1       0x2B
 
-// OPERATION_MODE
 #define MODE_STANDBY        0x00
 #define MODE_RTP            0x01
 
 volatile bool g_irqFlag = false;
-
-// ---------- Robust I2C helpers ----------
-static const uint8_t I2C_RETRIES = 5;
 
 bool writeReg_raw(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(DA7280_ADDR);
@@ -36,307 +29,224 @@ bool writeReg_raw(uint8_t reg, uint8_t val) {
 bool readReg_raw(uint8_t reg, uint8_t &val) {
   Wire.beginTransmission(DA7280_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false; // Repeated START
+  if (Wire.endTransmission(false) != 0) return false;
   delayMicroseconds(50);
   if (Wire.requestFrom((int)DA7280_ADDR, 1, (int)true) != 1) return false;
   val = Wire.read();
   return true;
 }
 
-bool writeReg(uint8_t reg, uint8_t val) {
-  for (uint8_t i=0; i<I2C_RETRIES; i++) {
-    if (writeReg_raw(reg, val)) {
-      // Verify write
-      uint8_t verify;
-      if (readReg_raw(reg, verify) && verify == val) {
-        return true;
-      }
-    }
-    delay(2);
-  }
-  Serial.printf("  [FAIL] Write 0x%02X to reg 0x%02X failed\n", val, reg);
-  return false;
-}
-
 bool readReg(uint8_t reg, uint8_t &val) {
-  for (uint8_t i=0; i<I2C_RETRIES; i++) {
+  for (int i=0; i<5; i++) {
     if (readReg_raw(reg, val)) return true;
     delay(2);
   }
-  Serial.printf("  [FAIL] Read reg 0x%02X failed\n", reg);
   return false;
 }
 
-// ---------- IRQ ----------
 void IRAM_ATTR onIRQ() { g_irqFlag = true; }
 
-// ---------- INT utils ----------
-uint8_t clearIntStatusOnce(){ 
-  uint8_t s=0; 
-  readReg(REG_INT_STATUS, s); 
-  return s; 
-}
-
-void clearAllLatchedInterrupts(){
-  for (int i=0; i<5; ++i){ 
-    if (clearIntStatusOnce()==0x00) break; 
-    delay(2); 
-  }
-}
-
-// ---------- TOP_CTL1 helpers ----------
 bool setTopCtl1(uint8_t op_mode, bool standby_en, bool seq_start){
   uint8_t v = ((seq_start?1:0)<<4) | ((standby_en?1:0)<<1) | (op_mode & 0x07);
-  return writeReg(REG_TOP_CTL1, v);
+  return writeReg_raw(REG_TOP_CTL1, v);
 }
 
 bool enterStandby(){ return setTopCtl1(MODE_STANDBY, true, false); }
 bool enterRTP()    { return setTopCtl1(MODE_RTP, false, false); }
 
-// ---------- Status dump ----------
-void dumpInterruptStatus(const char* tag){
-  uint8_t s=0, m=0;
-  readReg(REG_INT_STATUS, s);
-  readReg(REG_INT_MASK, m);
-  Serial.printf("%s: STATUS=0x%02X, MASK=0x%02X\n", tag, s, m);
-}
-
-// ---------- I2C Scanner ----------
 void scanI2C() {
-  Serial.println("\n=== I2C Bus Scan ===");
-  bool found = false;
+  Serial.println("\n=== I2C Scan ===");
   for (uint8_t addr = 0x08; addr < 0x78; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      Serial.printf("  Device found at 0x%02X", addr);
+      Serial.printf("  0x%02X", addr);
       if (addr == 0x4A) Serial.print(" (DA7280 primary)");
       if (addr == 0x4B) Serial.print(" (DA7280 alt)");
       Serial.println();
-      found = true;
     }
   }
-  if (!found) Serial.println("  No devices found!");
   Serial.println();
 }
 
-// ---------- Diagnostic registers ----------
 void diagRegisters() {
-  Serial.println("=== Register Diagnostics ===");
+  Serial.println("=== Registers ===");
   uint8_t val;
-  
   const uint8_t regs[] = {0x00, 0x09, 0x0A, 0x0B, 0x0F, 0x22, 0x23, 0x27, 0x28, 0x2B};
   const char* names[] = {"CHIP_REV", "INT_MASK", "INT_STATUS", "ENABLE", 
-                         "RTP_INPUT", "TOP_CTL1", "TOP_CTL2", "CALIB_V2I_H", "CALIB_V2I_L", "ACTUATOR1"};
+                         "RTP_INPUT", "TOP_CTL1", "TOP_CTL2", "V2I_H", "V2I_L", "ACTUATOR1"};
   
   for (int i=0; i<10; i++) {
     if (readReg(regs[i], val)) {
-      Serial.printf("  0x%02X %-12s = 0x%02X", regs[i], names[i], val);
+      Serial.printf("  0x%02X %-10s = 0x%02X", regs[i], names[i], val);
       if (regs[i] == 0x0A && val != 0x00) {
         Serial.print(" [");
         if (val & 0x20) Serial.print("UVLO ");
         if (val & 0x10) Serial.print("OVT ");
         if (val & 0x08) Serial.print("OVD ");
         if (val & 0x04) Serial.print("OC ");
-        if (val & 0x02) Serial.print("SEQ ");
         if (val & 0x01) Serial.print("UVLO2");
         Serial.print("]");
       }
       Serial.println();
-    } else {
-      Serial.printf("  0x%02X %-12s = READ FAILED\n", regs[i], names[i]);
     }
   }
   Serial.println();
 }
 
-// ---------- Motor control ----------
 bool rampVibrate(uint8_t target, uint16_t hold_ms){
-  Serial.println("  Entering standby...");
-  writeReg(REG_ENABLE, 0x00);
+  Serial.println("  Stopping...");
+  writeReg_raw(REG_ENABLE, 0x00);
   enterStandby();
-  clearAllLatchedInterrupts();
+  delay(10);
 
-  Serial.println("  Entering RTP mode...");
-  if (!enterRTP()) {
-    Serial.println("  [ERROR] Failed to enter RTP mode");
-    return false;
-  }
+  Serial.println("  Entering RTP...");
+  if (!enterRTP()) return false;
   
-  Serial.println("  Enabling output...");
-  if (!writeReg(REG_ENABLE, 0x01)) {
-    Serial.println("  [ERROR] Failed to enable output");
-    return false;
-  }
-
-  // Verify enable worked
-  uint8_t enCheck;
-  readReg(REG_ENABLE, enCheck);
-  Serial.printf("  ENABLE register readback: 0x%02X\n", enCheck);
+  Serial.println("  Enabling...");
+  if (!writeReg_raw(REG_ENABLE, 0x01)) return false;
 
   Serial.printf("  Ramping to %d...\n", target);
   uint8_t amp = 12;
   while (amp < target){
-    if (!writeReg(REG_RTP_INPUT, amp)) {
-      Serial.println("  [ERROR] RTP write failed during ramp");
-    }
+    writeReg_raw(REG_RTP_INPUT, amp);
     delay(35);
     if (g_irqFlag) {
-      writeReg(REG_ENABLE, 0x00);
+      writeReg_raw(REG_ENABLE, 0x00);
       enterStandby();
-      delay(2);
       g_irqFlag = false;
-      dumpInterruptStatus("IRQ during ramp");
+      Serial.println("  IRQ during ramp!");
       return false;
     }
-    amp = (uint8_t)min<int>(amp + 8, target);
+    int next = amp + 8;
+    amp = (next > target) ? target : (uint8_t)next;
   }
 
-  Serial.printf("  Holding at %d for %d ms...\n", target, hold_ms);
-  writeReg(REG_RTP_INPUT, target);
+  Serial.printf("  Holding %d ms...\n", hold_ms);
+  writeReg_raw(REG_RTP_INPUT, target);
   uint32_t t0 = millis();
   while ((millis()-t0) < hold_ms){
     if (g_irqFlag) {
-      writeReg(REG_ENABLE, 0x00);
+      writeReg_raw(REG_ENABLE, 0x00);
       enterStandby();
-      delay(2);
       g_irqFlag = false;
-      dumpInterruptStatus("IRQ during hold");
+      Serial.println("  IRQ during hold!");
       return false;
     }
     delay(5);
   }
 
-  Serial.println("  Stopping...");
-  writeReg(REG_ENABLE, 0x00);
+  Serial.println("  Done.");
+  writeReg_raw(REG_ENABLE, 0x00);
   enterStandby();
-  delay(2);
-  dumpInterruptStatus("Post");
   return true;
 }
 
-// ---------- Setup ----------
 void setup(){
   Serial.begin(115200);
-  delay(2000); // Give time to open serial monitor
+  delay(2000);
   
-  Serial.println("\n\n=== DA7280 Haptic Driver Diagnostic ===\n");
+  Serial.println("\n=== DA7280 Diagnostic ===\n");
 
-  // Initialize I2C with explicit pins
-  Wire.begin(21, 22);  // SDA=21, SCL=22 (ESP32 default)
-  Wire.setClock(100000); // 100 kHz standard mode
-  Serial.println("I2C initialized: SDA=21, SCL=22, 100kHz");
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  Serial.println("I2C: 100kHz, SDA=21, SCL=22");
 
-  // Scan bus
   scanI2C();
 
-  // Try to detect DA7280 at both addresses
   bool found = false;
   for (uint8_t addr : {DA7280_ADDR_PRIMARY, DA7280_ADDR_ALT}) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
       DA7280_ADDR = addr;
-      Serial.printf("DA7280 detected at 0x%02X\n\n", addr);
+      Serial.printf("DA7280 at 0x%02X\n\n", addr);
       found = true;
       break;
     }
   }
 
   if (!found) {
-    Serial.println("ERROR: No DA7280 found at 0x4A or 0x4B!");
-    Serial.println("Check:");
-    Serial.println("  - Power supply (3.3V)");
-    Serial.println("  - I2C connections (SDA=21, SCL=22)");
-    Serial.println("  - Pull-up resistors (4.7k to 3.3V)");
-    Serial.println("  - Common ground");
+    Serial.println("ERROR: No DA7280!");
     while(1) delay(1000);
   }
 
-  // Read chip revision
-  uint8_t chipRev;
-  if (readReg(REG_CHIP_REV, chipRev)) {
-    Serial.printf("Chip Revision: 0x%02X\n", chipRev);
-  } else {
-    Serial.println("WARNING: Cannot read chip revision!");
-  }
+  uint8_t rev;
+  readReg(REG_CHIP_REV, rev);
+  Serial.printf("Chip Rev: 0x%02X\n", rev);
 
-  // Initial register dump
   diagRegisters();
 
-  // Force standby and reset
-  Serial.println("=== Initialization Sequence ===");
-  Serial.println("Forcing standby mode...");
-  enterStandby();
-  delay(10);
-
-  // Force ERM mode
-  uint8_t act;
-  if (readReg(REG_ACTUATOR1, act)){
-    act &= ~0x01; // Clear bit 0 for ERM
-    if (writeReg(REG_ACTUATOR1, act)) {
-      Serial.printf("ACTUATOR1 set to 0x%02X (ERM mode)\n", act);
-    }
-  }
-
-  // Setup IRQ pin
-  pinMode(PIN_IRQ, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_IRQ), onIRQ, FALLING);
-  Serial.println("IRQ pin configured on GPIO27");
-
-  // Check for fault conditions
-  uint8_t status;
-  if (readReg(REG_INT_STATUS, status)) {
-    Serial.printf("Initial INT_STATUS: 0x%02X\n", status);
-    if (status & 0x20) Serial.println("  WARNING: UVLO (Under-Voltage) detected!");
-    if (status & 0x10) Serial.println("  WARNING: OVT (Over-Temperature) detected!");
-    if (status & 0x08) Serial.println("  WARNING: OVD (Over-Voltage) detected!");
-    if (status & 0x04) Serial.println("  WARNING: OC (Over-Current) detected - check motor!");
-    if (status & 0x01) Serial.println("  WARNING: UVLO2 (Under-Voltage 2) detected!");
-    
-    if (status != 0x00) {
-      Serial.println("\n*** FAULT CONDITION ACTIVE - Chip is protecting itself ***");
-      Serial.println("The DA7280 will refuse writes until faults are cleared.\n");
-      Serial.println("Try:");
-      Serial.println("  1. Disconnect motor and power cycle");
-      Serial.println("  2. Check VDD voltage (should be stable 3.3V)");
-      Serial.println("  3. Ensure motor is 8-16 ohms ERM type");
-      Serial.println("  4. Check all power connections\n");
-    }
-  }
-
-  // Try to clear status by reading multiple times
-  Serial.println("Attempting to clear fault status...");
-  for (int i=0; i<10; i++) {
-    readReg(REG_INT_STATUS, status);
-    if (status == 0x00) {
-      Serial.println("Faults cleared!");
+  // === RECOVERY SEQUENCE ===
+  Serial.println("=== RECOVERY ===");
+  
+  Serial.println("1. Force power-down sequence...");
+  writeReg_raw(REG_ENABLE, 0x00);
+  writeReg_raw(REG_TOP_CTL1, 0x00);  // All bits off
+  delay(100);
+  
+  Serial.println("2. Software reset...");
+  writeReg_raw(0x01, 0x80);  // Reset bit
+  delay(100);
+  
+  Serial.println("3. Clear all interrupt events...");
+  writeReg_raw(0x01, 0xFF);  // Clear all event bits
+  writeReg_raw(0x02, 0xFF);  // IRQ_EVENT2
+  delay(50);
+  
+  uint8_t stat;
+  readReg(REG_INT_STATUS, stat);
+  Serial.printf("   Status after clear: 0x%02X\n", stat);
+  
+  Serial.println("4. Try writing SNP_MEM registers (0x1C-0x1E)...");
+  // Some chips need these written to exit fault state
+  writeReg_raw(0x1C, 0x00);
+  writeReg_raw(0x1D, 0x00);
+  writeReg_raw(0x1E, 0x00);
+  delay(50);
+  
+  Serial.println("5. Clear TOP_CTL2...");
+  uint8_t tc2;
+  readReg(0x23, tc2);
+  Serial.printf("   Was: 0x%02X\n", tc2);
+  writeReg_raw(0x23, 0x00);
+  delay(50);
+  readReg(0x23, tc2);
+  Serial.printf("   Now: 0x%02X\n", tc2);
+  
+  Serial.println("6. Clear INT_STATUS by reading...");
+  for (int i=0; i<5; i++) {
+    readReg(REG_INT_STATUS, stat);
+    Serial.printf("   %d: 0x%02X\n", i+1, stat);
+    if (stat == 0) {
+      Serial.println("   *** CLEARED! ***");
       break;
     }
-    delay(10);
+    delay(20);
   }
   
-  dumpInterruptStatus("After clear attempt");
-
-  // Unmask all interrupts
-  Serial.println("Attempting to unmask interrupts...");
-  if (writeReg(REG_INT_MASK, 0x00)) {
-    Serial.println("Interrupts unmasked successfully");
-  } else {
-    Serial.println("WARNING: Failed to unmask interrupts (chip in fault state)");
-  }
-
-  // Final register dump
-  Serial.println("\n=== Post-Init Register State ===");
+  Serial.println("4. Force standby...");
+  enterStandby();
+  delay(50);
+  
+  Serial.println("5. Set ERM mode...");
+  uint8_t act;
+  readReg(REG_ACTUATOR1, act);
+  act &= ~0x01;
+  writeReg_raw(REG_ACTUATOR1, act);
+  
+  Serial.println("6. Unmask interrupts...");
+  writeReg_raw(REG_INT_MASK, 0x00);
+  
+  Serial.println();
   diagRegisters();
 
-  Serial.println("=== Ready ===");
-  Serial.println("Commands:");
-  Serial.println("  <intensity> <duration>  - Vibrate (e.g., '64 800')");
-  Serial.println("  scan                     - Rescan I2C bus");
-  Serial.println("  diag                     - Dump registers");
-  Serial.println();
+  pinMode(PIN_IRQ, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_IRQ), onIRQ, FALLING);
+
+  Serial.println("Ready! Commands:");
+  Serial.println("  <intensity> <duration>  (e.g., 64 800)");
+  Serial.println("  scan / diag\n");
 }
 
-// ---------- Loop ----------
 void loop(){
   if (Serial.available()){
     String input = Serial.readStringUntil('\n');
@@ -351,25 +261,19 @@ void loop(){
     else {
       int intensity = input.toInt();
       int duration = 0;
-      int spacePos = input.indexOf(' ');
-      if (spacePos > 0) {
-        duration = input.substring(spacePos+1).toInt();
-      }
+      int sp = input.indexOf(' ');
+      if (sp > 0) duration = input.substring(sp+1).toInt();
 
-      if (intensity >= 0 && intensity <= 255 && duration > 0){
-        Serial.printf("\n=== RTP Vibrate: %d intensity, %d ms ===\n", intensity, duration);
-        bool ok = rampVibrate((uint8_t)intensity, (uint16_t)duration);
-        Serial.println(ok ? "=== Done ===\n" : "=== Aborted ===\n");
-      } else {
-        Serial.println("Invalid input. Example: 64 800");
+      if (intensity > 0 && intensity <= 255 && duration > 0){
+        Serial.printf("\n=== Vibrate %d @ %dms ===\n", intensity, duration);
+        rampVibrate((uint8_t)intensity, (uint16_t)duration);
       }
     }
   }
 
-  // Check for spontaneous IRQs
   if (g_irqFlag) {
     g_irqFlag = false;
-    Serial.println("\n! Unexpected IRQ detected !");
-    dumpInterruptStatus("Unexpected");
+    Serial.println("\n! IRQ !");
+    diagRegisters();
   }
 }
